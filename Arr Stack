@@ -1,0 +1,151 @@
+#!/bin/bash
+
+# ==============================================================================
+# CONFIGURATION VARIABLES - PARAMETERS MATCHING YOUR UPDATED NETWORK
+# ==============================================================================
+START_VMID=5001
+BRIDGE="vmbr0"
+GATEWAY="192.168.80.1"       # <-- Updated to your Gateway IP
+STORAGE="local-lvm"         # <-- Replace with your Proxmox Target Storage Vol
+SAMBA_SERVER="192.168.80.2" # <-- Updated to your Samba Share Server IP
+SAMBA_PASSWORD="YourSaMediaPasswordHere" # <-- Replace with sa_media password
+
+# Dictionary of Apps: "Static IP Address/CIDR:WebUI-Port:DeploymentType"
+declare -A APPS
+APPS=(
+    ["prowlarr"]="192.168.80.200/24:9696:native"
+    ["sonarr"]="192.168.80.201/24:8989:native"
+    ["radarr"]="192.168.80.202/24:7878:native"
+    ["lidarr"]="192.168.80.203/24:8686:native"
+    ["bazarr"]="192.168.80.204/24:6767:native"
+    ["qbittorrent"]="192.168.80.205/24:8080:native"
+    ["sabnzbd"]="192.168.80.206/24:8081:native"
+    ["jellyfin"]="192.168.80.207/24:8096:native"
+    ["profilarr"]="192.168.80.208/24:80:native"
+    ["neutarr"]="192.168.80.209/24:9705:docker"
+    ["watchtower"]="192.168.80.210/24:80:docker"
+    ["dozzle"]="192.168.80.211/24:8080:docker"
+    ["qui"]="192.168.80.212/24:8000:docker"
+)
+
+# Download the latest stable Alpine template if not present
+TEMPLATE_STORAGE="local"
+TEMPLATE_DIR="/var/lib/vz/template/ct"
+TEMPLATE_NAME="alpine-3.20-default_20240602_amd64.tar.xz"
+
+if [ ! -f "${TEMPLATE_DIR}/${TEMPLATE_NAME}" ]; then
+    echo "[-] Downloading Alpine template..."
+    wget -P "${TEMPLATE_DIR}" "https://download.proxmox.com/images/system/${TEMPLATE_NAME}"
+fi
+
+CURRENT_ID=$START_VMID
+
+# Sequential execution array mapping to exact updated VMID order
+ORDERED_APPS=(
+    "prowlarr" "sonarr" "radarr" "lidarr" "bazarr" 
+    "qbittorrent" "sabnzbd" "jellyfin" "profilarr" 
+    "neutarr" "watchtower" "dozzle" "qui"
+)
+
+for APP in "${ORDERED_APPS[@]}"; do
+    VAL="${APPS[$APP]}"
+    IP="${VAL%%:*}"
+    REST="${VAL#*:}"
+    PORT="${REST%%:*}"
+    TYPE="${REST##*:}"
+    
+    echo "========================================================================"
+    echo "Deploying ${APP^^} on Container ID: ${CURRENT_ID} [Type: ${TYPE^^}]"
+    echo "========================================================================"
+
+    # 1. Spin up the container shell
+    pct create $CURRENT_ID "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE_NAME}" \
+        -cores 2 \
+        -memory 1024 \
+        -swap 512 \
+        -hostname "$APP" \
+        -ostype alpine \
+        -storage "$STORAGE" \
+        -rootfs "${STORAGE}:12" \
+        -net0 name=eth0,bridge=${BRIDGE},ip=${IP},gw=${GATEWAY} \
+        -unprivileged 1 \
+        -start 1 \
+        -features nesting=1
+
+    echo "[-] Awaiting network loop..."
+    sleep 8
+
+    # 2. Add base system wrappers
+    pct exec $CURRENT_ID -- apk update
+    pct exec $CURRENT_ID -- apk add cifs-utils tzdata bash icu-libs sqlite-libs curl
+
+    # 3. Mount Samba Network Storage System
+    pct exec $CURRENT_ID -- mkdir -p /mnt/media
+    pct exec $CURRENT_ID -- sh -c "cat << 'EOF' > /root/.smbcredentials
+username=sa_media
+password=${SAMBA_PASSWORD}
+domain=WORKGROUP
+EOF"
+    pct exec $CURRENT_ID -- chmod 600 /root/.smbcredentials
+    pct exec $CURRENT_ID -- sh -c "echo '//${SAMBA_SERVER}/Media /mnt/media cifs credentials=/root/.smbcredentials,uid=1000,gid=1000,file_mode=0775,dir_mode=0775,nofail 0 0' >> /etc/fstab"
+    pct exec $CURRENT_ID -- mount -a
+
+    # 4. Route installations based on environmental types
+    if [ "$TYPE" = "native" ]; then
+        case $APP in
+            prowlarr|sonarr|radarr|lidarr|bazarr)
+                pct exec $CURRENT_ID -- apk add $APP --repository=http://dl-cdn.alpinelinux.org/alpine/edge/testing
+                pct exec $CURRENT_ID -- rc-update add $APP default
+                pct exec $CURRENT_ID -- rc-service $APP start
+                ;;
+            qbittorrent)
+                pct exec $CURRENT_ID -- apk add qbittorrent-nox qbittorrent-nox-openrc
+                pct exec $CURRENT_ID -- rc-update add qbittorrent-nox default
+                pct exec $CURRENT_ID -- rc-service qbittorrent-nox start
+                ;;
+            sabnzbd)
+                pct exec $CURRENT_ID -- apk add sabnzbd --repository=http://dl-cdn.alpinelinux.org/alpine/edge/testing
+                pct exec $CURRENT_ID -- rc-update add sabnzbd default
+                pct exec $CURRENT_ID -- rc-service sabnzbd start
+                ;;
+            jellyfin)
+                pct exec $CURRENT_ID -- apk add jellyfin jellyfin-web jellyfin-openrc --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community
+                pct exec $CURRENT_ID -- rc-update add jellyfin default
+                pct exec $CURRENT_ID -- rc-service jellyfin start
+                ;;
+            profilarr)
+                pct exec $CURRENT_ID -- apk add profilarr --repository=http://dl-cdn.alpinelinux.org/alpine/edge/testing
+                pct exec $CURRENT_ID -- rc-update add profilarr default
+                pct exec $CURRENT_ID -- rc-service profilarr start
+                ;;
+        esac
+    else
+        # Docker layer compilation
+        pct exec $CURRENT_ID -- apk add docker docker-cli-compose
+        pct exec $CURRENT_ID -- rc-update add docker default
+        pct exec $CURRENT_ID -- rc-service docker start
+        sleep 3
+
+        case $APP in
+            neutarr)
+                pct exec $CURRENT_ID -- docker run -d --name neutarr --restart unless-stopped -p 9705:9705 -v /root/config:/config iampuid0/neutarr:latest
+                ;;
+            watchtower)
+                pct exec $CURRENT_ID -- docker run -d --name watchtower --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower
+                ;;
+            dozzle)
+                pct exec $CURRENT_ID -- docker run -d --name dozzle --restart unless-stopped -p 8080:8080 -v /var/run/docker.sock:/var/run/docker.sock amir20/dozzle:latest
+                ;;
+            qui)
+                pct exec $CURRENT_ID -- docker run -d --name qui --restart unless-stopped -p 8000:8000 -v /root/config:/config -v /mnt/media:/mnt/media s005am/qui:latest
+                ;;
+        esac
+    fi
+
+    echo "[+] ${APP^^} deployed successfully. UI Access: http://${IP%%/*}:${PORT}"
+    CURRENT_ID=$((CURRENT_ID + 1))
+done
+
+echo "========================================================================"
+echo "Deployment Complete! Containers 5001 through 5013 are now operational."
+echo "========================================================================"
