@@ -1,14 +1,19 @@
 #!/bin/bash
 
 # ==============================================================================
-# CONFIGURATION VARIABLES - PARAMETERS MATCHING YOUR UPDATED NETWORK
+# CONFIGURATION VARIABLES - PARAMETERS MATCHING YOUR NETWORK
 # ==============================================================================
 START_VMID=5001
 BRIDGE="vmbr0"
-GATEWAY="192.168.80.1"       # <-- Updated to your Gateway IP
-STORAGE="local-lvm"         # <-- Replace with your Proxmox Target Storage Vol
-SAMBA_SERVER="192.168.80.2" # <-- Updated to your Samba Share Server IP
-SAMBA_PASSWORD="YourSaMediaPasswordHere" # <-- Replace with sa_media password
+GATEWAY="192.168.80.1"       
+STORAGE="local-lvm"         
+SAMBA_SERVER="192.168.80.2" 
+SAMBA_PASSWORD="YourSaMediaPasswordHere" 
+
+# --- PRIVATE INTERNET ACCESS (PIA) VPN CLIENT CREDENTIALS ---
+PIA_USER="p1234567"          # <-- Replace with your real PIA Username
+PIA_PASS="YourPIAPassword"   # <-- Replace with your real PIA Password
+PIA_REGION="us_east"         # <-- Preferred region identifier (e.g. us_east, ca_ontario)
 
 # Dictionary of Apps: "Static IP Address/CIDR:WebUI-Port:DeploymentType"
 declare -A APPS
@@ -40,7 +45,6 @@ fi
 
 CURRENT_ID=$START_VMID
 
-# Sequential execution array mapping to exact updated VMID order
 ORDERED_APPS=(
     "prowlarr" "sonarr" "radarr" "lidarr" "bazarr" 
     "qbittorrent" "sabnzbd" "jellyfin" "profilarr" 
@@ -58,7 +62,7 @@ for APP in "${ORDERED_APPS[@]}"; do
     echo "Deploying ${APP^^} on Container ID: ${CURRENT_ID} [Type: ${TYPE^^}]"
     echo "========================================================================"
 
-    # 1. Spin up the container shell
+    # 1. Spin up the container shell with nesting and tun features required for VPN
     pct create $CURRENT_ID "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE_NAME}" \
         -cores 2 \
         -memory 1024 \
@@ -70,7 +74,7 @@ for APP in "${ORDERED_APPS[@]}"; do
         -net0 name=eth0,bridge=${BRIDGE},ip=${IP},gw=${GATEWAY} \
         -unprivileged 1 \
         -start 1 \
-        -features nesting=1
+        -features nesting=1,tun=1
 
     echo "[-] Awaiting network loop..."
     sleep 8
@@ -99,7 +103,61 @@ EOF"
                 pct exec $CURRENT_ID -- rc-service $APP start
                 ;;
             qbittorrent)
-                pct exec $CURRENT_ID -- apk add qbittorrent-nox qbittorrent-nox-openrc
+                # Install qBittorrent, WireGuard, iptables, and scripting dependencies
+                pct exec $CURRENT_ID -- apk add qbittorrent-nox qbittorrent-nox-openrc wireguard-tools iptables jq git
+
+                echo "[-] Configuring PIA WireGuard Client dependencies inside Container..."
+                # Clone PIA's official utility suite script repository
+                pct exec $CURRENT_ID -- git clone https://github.com/pia-foss/manual-connections.git /opt/pia-vpn
+                
+                # Provision credentials file for automated non-interactive login sequences
+                pct exec $CURRENT_ID -- sh -c "cat << 'EOF' > /opt/pia-vpn/pia_creds
+username=${PIA_USER}
+password=${PIA_PASS}
+EOF"
+                # Create wrapper runtime to safely trigger connection on boot
+                pct exec $CURRENT_ID -- sh -c "cat << 'EOF' > /etc/local.d/pia-vpn.start
+#!/bin/bash
+cd /opt/pia-vpn
+export PIA_USER=\$(awk -F= '/username/{print \$2}' /opt/pia-vpn/pia_creds)
+export PIA_PASS=\$(awk -F= '/password/{print \$2}' /opt/pia-vpn/pia_creds)
+export PIA_AUTOCONNECT=1
+export REGION_ID=${PIA_REGION}
+./run_setup.sh > /var/log/pia_vpn.log 2>&1
+EOF"
+                pct exec $CURRENT_ID -- chmod +x /etc/local.d/pia-vpn.start
+                pct exec $CURRENT_ID -- rc-update add local default
+
+                echo "[-] Setting up iptables Application-Level Kill Switch rules..."
+                # Block all outgoing traffic by default, except local subnet management and the wg0 interface
+                pct exec $CURRENT_ID -- sh -c "cat << 'EOF' > /etc/iptables.rules
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT DROP [0:0]
+-A OUTPUT -o lo -j ACCEPT
+-A OUTPUT -d 192.168.80.0/24 -j ACCEPT
+-A OUTPUT -o wg0 -j ACCEPT
+COMMIT
+EOF"
+                # Enable iptables on boot to apply firewall parameters
+                pct exec $CURRENT_ID -- rc-update add iptables default
+
+                echo "[-] Initializing qBittorrent profile rules and interface lock..."
+                # Create profile hierarchy pathing rules
+                pct exec $CURRENT_ID -- mkdir -p /root/.config/qBittorrent
+                
+                # Hardcode preferences layer forcing qBittorrent to bind strictly to WireGuard interface 'wg0'
+                pct exec $CURRENT_ID -- sh -c "cat << 'EOF' > /root/.config/qBittorrent/qBittorrent.conf
+[Preferences]
+Connection\Interface=wg0
+Connection\InterfaceName=wg0
+Downloads\SavePath=/mnt/media/downloads/
+Queueing\MaxActiveDownloads=5
+WebUI\Port=${PORT}
+EOF"
+                
+                # Start the qBittorrent daemon service runner
                 pct exec $CURRENT_ID -- rc-update add qbittorrent-nox default
                 pct exec $CURRENT_ID -- rc-service qbittorrent-nox start
                 ;;
@@ -147,5 +205,5 @@ EOF"
 done
 
 echo "========================================================================"
-echo "Deployment Complete! Containers 5001 through 5013 are now operational."
+echo "Deployment Complete! Container 5006 has native PIA WireGuard & Kill Switch."
 echo "========================================================================"
