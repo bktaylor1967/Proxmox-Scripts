@@ -9,204 +9,242 @@ START_VMID=5001
 BRIDGE="vmbr0"
 GATEWAY="192.168.80.1"
 STORAGE="local-lvm"
+TEMPLATE="local:vztmpl/alpine-3.20-default_amd64.tar.xz"
 TZ="America/New_York"
 
-# --- VPN ---
-PIA_USER="p1234567"
-PIA_PASS="YourPIAPassword"
-
-# --- ALERT WEBHOOKS ---
-DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXXX"
-TEAMS_WEBHOOK="https://outlook.office.com/webhook/XXXX"
-
-# --- Cloudflare ---
-CF_TOKEN="REPLACE_WITH_YOURS"
+# --- REQUIRED: EDIT THESE ---
+PIA_USER="p0973057"
+PIA_PASS="20Jetta09"
+CF_TOKEN="eyJhIjoiZTA4NDFhMTMyY2YxNDdjYjgxN2JlYmI1N2RhNzk0OWYiLCJ0IjoiZDg0Mzg4OGItZGQ2OC00NDc1LWExMjUtYjhkZTIxYjlmYWUyIiwicyI6IlltVmlaVGswWW1FdE5qUXhNaTAwTVRrM0xUazBPV1V0WkdGaFlqQmxOMkZpWmpSaiJ9"
+SAMBA_SERVER="192.168.80.2"
+SAMBA_USER="sa_media"
+SAMBA_PASS="Bkd-72-Movane"
 
 # ==============================================================================
-# APPS
+# CONTAINER MAP (VMID : NAME : IP : PORT)
 # ==============================================================================
 
-declare -A APPS=(
-  ["downloads"]="192.168.80.205/24:docker"
-  ["media"]="192.168.80.200/24:docker"
-  ["monitor"]="192.168.80.220/24:docker"
-  ["cloudflared"]="192.168.80.215/24:docker"
+CONTAINERS=(
+"5001:jellyfin:192.168.80.200/24"
+"5002:seerr:192.168.80.201/24"
+"5003:sonarr:192.168.80.202/24"
+"5004:radarr:192.168.80.203/24"
+"5005:prowlarr:192.168.80.204/24"
+"5006:downloads:192.168.80.205/24"
+"5007:bazarr:192.168.80.206/24"
+"5020:monitor:192.168.80.220/24"
+"5030:cloudflared:192.168.80.215/24"
 )
-
-ORDERED_APPS=(downloads media monitor cloudflared)
-CURRENT_ID=$START_VMID
 
 # ==============================================================================
 # HELPERS
 # ==============================================================================
 
-log(){ echo "[INFO] $1"; }
+log() {
+  echo -e "\e[32m[INFO]\e[0m $1"
+}
 
-create_container() {
-  pct create $CURRENT_ID local:vztmpl/alpine-3.20-default_amd64.tar.xz \
-    -hostname $1 \
-    -net0 name=eth0,bridge=$BRIDGE,ip=$2,gw=$GATEWAY \
-    -rootfs $STORAGE:4 \
-    -memory 2048 -cores 2 \
+create_ct() {
+  VMID=$1
+  NAME=$2
+  IP=$3
+
+  log "Creating $NAME ($VMID)"
+
+  pct create $VMID $TEMPLATE \
+    -hostname $NAME \
+    -net0 name=eth0,bridge=$BRIDGE,ip=$IP,gw=$GATEWAY \
+    -rootfs $STORAGE:8 \
+    -memory 1024 -cores 2 \
     -features nesting=1
 
-  pct start $CURRENT_ID
+  pct start $VMID
   sleep 5
 
-  pct exec $CURRENT_ID -- apk add docker curl bash
-  pct exec $CURRENT_ID -- rc-update add docker default
-  pct exec $CURRENT_ID -- service docker start
+  pct exec $VMID -- apk add --no-cache docker curl bash cifs-utils
+  pct exec $VMID -- rc-update add docker default
+  pct exec $VMID -- service docker start
+
+  mount_samba $VMID
+}
+
+mount_samba() {
+  VMID=$1
+
+  pct exec $VMID -- mkdir -p /mnt/media
+
+  pct exec $VMID -- sh -c "cat <<EOF > /root/.smbcredentials
+username=$SAMBA_USER
+password=$SAMBA_PASS
+EOF"
+
+  pct exec $VMID -- chmod 600 /root/.smbcredentials
+
+  pct exec $VMID -- sh -c "echo '//${SAMBA_SERVER}/Media /mnt/media cifs credentials=/root/.smbcredentials,uid=1000,gid=1000,file_mode=0775,dir_mode=0775,nofail 0 0' >> /etc/fstab"
+
+  pct exec $VMID -- mount -a
 }
 
 # ==============================================================================
-# DOWNLOAD STACK (VPN + FAILOVER + ALERTING)
+# DOCKER DEPLOY FUNCTIONS
 # ==============================================================================
+
+deploy_jellyfin() {
+  pct exec $1 -- docker run -d \
+    --name jellyfin \
+    -p 8096:8096 \
+    -v /mnt/media:/media \
+    --restart unless-stopped \
+    jellyfin/jellyfin
+}
+
+deploy_seerr() {
+  pct exec $1 -- docker run -d \
+    --name seerr \
+    -p 5055:5055 \
+    --restart unless-stopped \
+    fallenbagel/jellyseerr
+}
+
+deploy_sonarr() {
+  pct exec $1 -- docker run -d \
+    --name sonarr \
+    -p 8989:8989 \
+    -v /mnt/media:/data \
+    --restart unless-stopped \
+    lscr.io/linuxserver/sonarr
+}
+
+deploy_radarr() {
+  pct exec $1 -- docker run -d \
+    --name radarr \
+    -p 7878:7878 \
+    -v /mnt/media:/data \
+    --restart unless-stopped \
+    lscr.io/linuxserver/radarr
+}
+
+deploy_prowlarr() {
+  pct exec $1 -- docker run -d \
+    --name prowlarr \
+    -p 9696:9696 \
+    --restart unless-stopped \
+    lscr.io/linuxserver/prowlarr
+}
+
+deploy_bazarr() {
+  pct exec $1 -- docker run -d \
+    --name bazarr \
+    -p 6767:6767 \
+    -v /mnt/media:/data \
+    --restart unless-stopped \
+    lscr.io/linuxserver/bazarr
+}
 
 deploy_downloads() {
 
-pct exec $CURRENT_ID -- mkdir -p /opt/downloads
+  # VPN
+  pct exec $1 -- docker run -d \
+    --name gluetun \
+    --cap-add=NET_ADMIN \
+    --device /dev/net/tun \
+    -e VPN_SERVICE_PROVIDER=privateinternetaccess \
+    -e OPENVPN_USER="$PIA_USER" \
+    -e OPENVPN_PASSWORD="$PIA_PASS" \
+    -e SERVER_COUNTRIES="Sweden,Netherlands,swiss,denmark" \
+    -e SERVER_SELECTION_STRATEGY=latency \
+    -e FIREWALL=on \
+    -e TZ=$TZ \
+    -p 8080:8080 \
+    -p 8081:8081 \
+    -p 6881:6881 \
+    -p 6881:6881/udp \
+    --restart unless-stopped \
+    qmcgaw/gluetun
 
-pct exec $CURRENT_ID -- docker run -d \
-  --name gluetun \
-  --cap-add=NET_ADMIN \
-  --device /dev/net/tun \
-  -e VPN_SERVICE_PROVIDER=privateinternetaccess \
-  -e OPENVPN_USER="$PIA_USER" \
-  -e OPENVPN_PASSWORD="$PIA_PASS" \
-  -e SERVER_COUNTRIES="United States,Sweden,Netherlands" \
-  -e SERVER_SELECTION_STRATEGY=latency \
-  -e FIREWALL=on \
-  -e TZ=$TZ \
-  -p 8080:8080 \
-  -p 8081:8081 \
-  -p 9999:9999 \
-  --restart unless-stopped \
-  qmcgaw/gluetun
+  sleep 10
 
-sleep 10
+  # qBittorrent
+  pct exec $1 -- docker run -d \
+    --name qbittorrent \
+    --network container:gluetun \
+    -e WEBUI_PORT=8080 \
+    --restart unless-stopped \
+    lscr.io/linuxserver/qbittorrent
 
-# qBittorrent
-pct exec $CURRENT_ID -- docker run -d \
-  --name qbittorrent \
-  --network container:gluetun \
-  -e WEBUI_PORT=8080 \
-  -v /opt/downloads/qbt:/config \
-  --restart unless-stopped \
-  lscr.io/linuxserver/qbittorrent
-
-# SABnzbd
-pct exec $CURRENT_ID -- docker run -d \
-  --name sabnzbd \
-  --network container:gluetun \
-  -v /opt/downloads:/downloads \
-  --restart unless-stopped \
-  lscr.io/linuxserver/sabnzbd
-
-# -------------------------
-# ALERTING SCRIPT
-# -------------------------
-
-pct exec $CURRENT_ID -- sh -c "cat << 'EOF' > /alert.sh
-#!/bin/sh
-
-STATUS=\$(wget -qO- http://localhost:9999/v1/openvpn/status | grep -i 'connected')
-
-if [ -z \"\$STATUS\" ]; then
-  MSG=\"🚨 VPN DOWN on $(hostname)\"
-
-  curl -H 'Content-Type: application/json' \
-       -d \"{\\\"content\\\": \\\"\$MSG\\\"}\" \
-       $DISCORD_WEBHOOK
-
-  curl -H 'Content-Type: application/json' \
-       -d \"{\\\"text\\\": \\\"\$MSG\\\"}\" \
-       $TEAMS_WEBHOOK
-fi
-EOF"
-
-pct exec $CURRENT_ID -- chmod +x /alert.sh
-pct exec $CURRENT_ID -- sh -c "echo '*/2 * * * * /alert.sh' | crontab -"
+  # SABnzbd
+  pct exec $1 -- docker run -d \
+    --name sabnzbd \
+    --network container:gluetun \
+    --restart unless-stopped \
+    lscr.io/linuxserver/sabnzbd
 }
-
-# ==============================================================================
-# MEDIA STACK
-# ==============================================================================
-
-deploy_media() {
-
-pct exec $CURRENT_ID -- docker run -d \
-  --name jellyfin -p 8096:8096 \
-  --restart unless-stopped jellyfin/jellyfin
-
-pct exec $CURRENT_ID -- docker run -d \
-  --name seerr -p 5055:5055 \
-  --restart unless-stopped fallenbagel/jellyseerr
-}
-
-# ==============================================================================
-# MONITORING STACK
-# ==============================================================================
 
 deploy_monitor() {
 
-pct exec $CURRENT_ID -- mkdir -p /opt/monitor
+  pct exec $1 -- docker run -d \
+    --name grafana \
+    -p 3000:3000 \
+    -e GF_SECURITY_ADMIN_PASSWORD=admin \
+    --restart unless-stopped \
+    grafana/grafana
 
-# Prometheus config
-pct exec $CURRENT_ID -- sh -c "cat << 'EOF' > /opt/monitor/prometheus.yml
-global:
-  scrape_interval: 5s
-scrape_configs:
-  - job_name: gluetun
-    static_configs:
-      - targets: ['192.168.80.205:9999']
-EOF"
-
-# Prometheus
-pct exec $CURRENT_ID -- docker run -d \
-  --name prometheus \
-  -p 9090:9090 \
-  -v /opt/monitor:/etc/prometheus \
-  prom/prometheus
-
-# Grafana
-pct exec $CURRENT_ID -- docker run -d \
-  --name grafana \
-  -p 3000:3000 \
-  -e GF_SECURITY_ADMIN_PASSWORD=admin \
-  grafana/grafana
+  pct exec $1 -- docker run -d \
+    --name prometheus \
+    -p 9090:9090 \
+    --restart unless-stopped \
+    prom/prometheus
 }
 
-# ==============================================================================
-# CLOUDFLARE
-# ==============================================================================
-
-deploy_cf() {
-pct exec $CURRENT_ID -- docker run -d \
-  --name cloudflared \
-  --network host \
-  cloudflare/cloudflared \
-  tunnel run --token $CF_TOKEN
+deploy_cloudflare() {
+  pct exec $1 -- docker run -d \
+    --name cloudflared \
+    --network host \
+    --restart unless-stopped \
+    cloudflare/cloudflared \
+    tunnel run --token $CF_TOKEN
 }
 
 # ==============================================================================
 # MAIN LOOP
 # ==============================================================================
 
-for APP in "${ORDERED_APPS[@]}"; do
+for ENTRY in "${CONTAINERS[@]}"; do
 
-IP=$(echo ${APPS[$APP]} | cut -d':' -f1)
+  VMID=$(echo $ENTRY | cut -d':' -f1)
+  NAME=$(echo $ENTRY | cut -d':' -f2)
+  IP=$(echo $ENTRY | cut -d':' -f3)
 
-create_container $APP $IP
+  create_ct $VMID $NAME $IP
 
-case $APP in
-  downloads) deploy_downloads ;;
-  media) deploy_media ;;
-  monitor) deploy_monitor ;;
-  cloudflared) deploy_cf ;;
-esac
+  case $NAME in
+    jellyfin) deploy_jellyfin $VMID ;;
+    seerr) deploy_seerr $VMID ;;
+    sonarr) deploy_sonarr $VMID ;;
+    radarr) deploy_radarr $VMID ;;
+    prowlarr) deploy_prowlarr $VMID ;;
+    bazarr) deploy_bazarr $VMID ;;
+    downloads) deploy_downloads $VMID ;;
+    monitor) deploy_monitor $VMID ;;
+    cloudflared) deploy_cloudflare $VMID ;;
+  esac
 
-((CURRENT_ID++))
+  log "$NAME deployed at $IP"
 
 done
 
-echo "✅ FULL STACK WITH VPN + ALERTING DEPLOYED"
+# ==============================================================================
+# DONE
+# ==============================================================================
+
+echo ""
+log "✅ FULL STANDALONE ARR STACK DEPLOYED"
+echo ""
+echo "🌐 Jellyfin: http://192.168.80.200:8096"
+echo "🌐 Seerr:   http://192.168.80.201:5055"
+echo "📊 Grafana: http://192.168.80.220:3000"
+echo ""
+echo "🔒 Downloads are VPN protected"
+echo "🌍 Cloudflare tunnel active"
+echo ""
+``
