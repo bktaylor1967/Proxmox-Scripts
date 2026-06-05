@@ -13,12 +13,12 @@ TEMPLATE="local:vztmpl/alpine-3.20-default_amd64.tar.xz"
 TZ="America/New_York"
 
 # --- REQUIRED: EDIT THESE ---
-PIA_USER="p0973057"
-PIA_PASS="20Jetta09"
-CF_TOKEN="eyJhIjoiZTA4NDFhMTMyY2YxNDdjYjgxN2JlYmI1N2RhNzk0OWYiLCJ0IjoiZDg0Mzg4OGItZGQ2OC00NDc1LWExMjUtYjhkZTIxYjlmYWUyIiwicyI6IlltVmlaVGswWW1FdE5qUXhNaTAwTVRrM0xUazBPV1V0WkdGaFlqQmxOMkZpWmpSaiJ9"
-SAMBA_SERVER="192.168.80.2"
-SAMBA_USER="sa_media"
-SAMBA_PASS="Bkd-72-Movane"
+PIA_USER="Re-Place-me"
+PIA_PASS="Re-Place-me"
+CF_TOKEN="Re-Place-me"
+SAMBA_SERVER="Re-Place-me"
+SAMBA_USER="Re-Place-me"
+SAMBA_PASS="Re-Place-me"
 
 # ==============================================================================
 # CONTAINER MAP (VMID : NAME : IP : PORT)
