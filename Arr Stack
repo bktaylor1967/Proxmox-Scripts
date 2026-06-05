@@ -5,10 +5,10 @@
 # ==============================================================================
 START_VMID=5001
 BRIDGE="vmbr0"
-GATEWAY="192.168.80.1"       # <-- Updated to your Gateway IP
-STORAGE="local-lvm"         # <-- Replace with your Proxmox Target Storage Vol
-SAMBA_SERVER="192.168.80.2" # <-- Updated to your Samba Share Server IP
-SAMBA_PASSWORD="YourSaMediaPasswordHere" # <-- Replace with sa_media password
+GATEWAY="192.168.80.1"          # <-- Updated to your Gateway IP
+STORAGE="Rust"                  # <-- Replace with your Proxmox Target Storage Vol
+SAMBA_SERVER="192.168.80.2"     # <-- Updated to your Samba Share Server IP
+SAMBA_PASSWORD="Media@2026!"    # <-- Replace with sa_media password
 
 # Dictionary of Apps: "Static IP Address/CIDR:WebUI-Port:DeploymentType"
 declare -A APPS
