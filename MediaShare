@@ -1,0 +1,29 @@
+# 1. Create the Media group and the sa_media system user
+sudo groupadd -g 1500 Media
+sudo useradd -u 1500 -g Media -m -s /bin/bash sa_media
+
+# 2. Set a Samba password for sa_media (you will be prompted to type it)
+# Remember this password! You will input it into the Proxmox script below.
+sudo smbpasswd -a sa_media
+
+# 3. Create the Media storage directory and fix ownership permissions
+sudo mkdir -p /mnt/Media
+sudo chown -R sa_media:Media /mnt/Media
+sudo chmod -R 775 /mnt/Media
+
+# 4. Append the share configuration to Samba
+cat << 'EOF' | sudo tee -a /etc/samba/smb.conf
+
+[Media]
+   path = /mnt/Media
+   browseable = yes
+   read only = no
+   guest ok = no
+   create mask = 0775
+   directory mask = 0775
+   force user = sa_media
+   force group = Media
+EOF
+
+# 5. Restart Samba services to apply changes
+sudo systemctl restart smbd
