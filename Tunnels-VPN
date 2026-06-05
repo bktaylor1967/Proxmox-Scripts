@@ -1,0 +1,243 @@
+#!/bin/bash
+set -e
+
+# ==============================================================================
+# 🔧 GLOBAL CONFIG
+# ==============================================================================
+
+START_VMID=5001
+BRIDGE="vmbr0"
+GATEWAY="192.168.80.1"
+STORAGE="local-lvm"
+TZ="America/New_York"
+
+# --- PIA VPN ---
+PIA_USER="p1234567"
+PIA_PASS="YourPIAPassword"
+PIA_REGION="us_east"
+
+# --- Cloudflare ---
+CF_TOKEN="eyJhIjoiZTA4NDFhMTMyY2YxNDdjYjgxN2JlYmI1N2RhNzk0OWYiLCJ0IjoiZDg0Mzg4OGItZGQ2OC00NDc1LWExMjUtYjhkZTIxYjlmYWUyIiwicyI6IlltVmlaVGswWW1FdE5qUXhNaTAwTVRrM0xUazBPV1V0WkdGaFlqQmxOMkZpWmpSaiJ9"
+
+# ==============================================================================
+# 📦 APPS
+# ==============================================================================
+
+declare -A APPS=(
+  ["prowlarr"]="192.168.80.200/24:9696:native"
+  ["sonarr"]="192.168.80.201/24:8989:native"
+  ["radarr"]="192.168.80.202/24:7878:native"
+  ["lidarr"]="192.168.80.203/24:8686:native"
+  ["bazarr"]="192.168.80.204/24:6767:native"
+  ["jellyfin"]="192.168.80.207/24:8096:native"
+
+  ["seerr"]="192.168.80.213/24:5055:docker"
+  ["nginxpm"]="192.168.80.214/24:81:docker"
+  ["cloudflared"]="192.168.80.215/24:0:docker"
+
+  # SECURE DOWNLOAD STACK
+  ["downloads"]="192.168.80.205/24:8080:docker"
+
+  ["watchtower"]="192.168.80.210/24:0:docker"
+  ["dozzle"]="192.168.80.211/24:8080:docker"
+)
+
+ORDERED_APPS=(
+  prowlarr sonarr radarr lidarr bazarr jellyfin
+  downloads
+  seerr nginxpm cloudflared watchtower dozzle
+)
+
+CURRENT_ID=$START_VMID
+
+# ==============================================================================
+# 🛠️ HELPERS
+# ==============================================================================
+
+log() {
+  echo -e "\e[32m[INFO]\e[0m $1"
+}
+
+create_container() {
+  local app=$1
+  local ip=$2
+
+  log "Creating $app ($CURRENT_ID)"
+
+  pct create $CURRENT_ID local:vztmpl/alpine-3.20-default_amd64.tar.xz \
+    -hostname $app \
+    -net0 name=eth0,bridge=$BRIDGE,ip=$ip,gw=$GATEWAY \
+    -rootfs $STORAGE:4 \
+    -memory 1024 -cores 2 \
+    -unprivileged 1 \
+    -features nesting=1
+
+  pct start $CURRENT_ID
+  sleep 5
+
+  pct exec $CURRENT_ID -- apk add --no-cache docker curl bash
+  pct exec $CURRENT_ID -- rc-update add docker default
+  pct exec $CURRENT_ID -- service docker start
+}
+
+# ==============================================================================
+# 🐳 DOCKER DEPLOY
+# ==============================================================================
+
+deploy_docker_app() {
+
+case $1 in
+
+# -------------------------
+# 🔒 SECURE DOWNLOAD STACK
+# -------------------------
+downloads)
+
+  pct exec $CURRENT_ID -- mkdir -p /opt/downloads
+
+  # GLUETUN (VPN + Kill Switch)
+  pct exec $CURRENT_ID -- docker run -d \
+    --name gluetun \
+    --cap-add=NET_ADMIN \
+    --device /dev/net/tun \
+    -e VPN_SERVICE_PROVIDER=privateinternetaccess \
+    -e VPN_TYPE=openvpn \
+    -e OPENVPN_USER="$PIA_USER" \
+    -e OPENVPN_PASSWORD="$PIA_PASS" \
+    -e SERVER_REGIONS="$PIA_REGION" \
+    -e TZ=$TZ \
+    -p 8080:8080 \
+    -p 8081:8081 \
+    -p 6881:6881 \
+    -p 6881:6881/udp \
+    -v /opt/downloads:/data \
+    --restart unless-stopped \
+    qmcgaw/gluetun
+
+  sleep 10
+
+  # QBittorrent (via VPN)
+  pct exec $CURRENT_ID -- docker run -d \
+    --name qbittorrent \
+    --network container:gluetun \
+    -e WEBUI_PORT=8080 \
+    -e PUID=1000 -e PGID=1000 \
+    -v /opt/downloads/qbt:/config \
+    --restart unless-stopped \
+    lscr.io/linuxserver/qbittorrent
+
+  # SABnzbd (via VPN)
+  pct exec $CURRENT_ID -- docker run -d \
+    --name sabnzbd \
+    --network container:gluetun \
+    -e PUID=1000 -e PGID=1000 \
+    -e TZ=$TZ \
+    -v /opt/downloads/sab:/config \
+    -v /opt/downloads:/downloads \
+    --restart unless-stopped \
+    lscr.io/linuxserver/sabnzbd
+;;
+
+# -------------------------
+seerr)
+  pct exec $CURRENT_ID -- docker run -d \
+    --name seerr \
+    -p 5055:5055 \
+    -e TZ=$TZ \
+    --restart unless-stopped \
+    fallenbagel/jellyseerr
+;;
+
+nginxpm)
+  pct exec $CURRENT_ID -- docker run -d \
+    --name npm \
+    -p 80:80 -p 81:81 -p 443:443 \
+    -v /opt/npm:/data \
+    --restart unless-stopped \
+    jc21/nginx-proxy-manager
+;;
+
+cloudflared)
+  pct exec $CURRENT_ID -- docker run -d \
+    --name cloudflared \
+    --network host \
+    --restart unless-stopped \
+    cloudflare/cloudflared \
+    tunnel run --token $CF_TOKEN
+;;
+
+watchtower)
+  pct exec $CURRENT_ID -- docker run -d \
+    --name watchtower \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    --restart unless-stopped \
+    containrrr/watchtower --cleanup --interval 300
+;;
+
+dozzle)
+  pct exec $CURRENT_ID -- docker run -d \
+    --name dozzle \
+    -p 8080:8080 \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    --restart unless-stopped \
+    amir20/dozzle
+;;
+
+esac
+}
+
+# ==============================================================================
+# ❤️ HEALTH CHECKS
+# ==============================================================================
+
+setup_health() {
+  pct exec $CURRENT_ID -- sh -c "cat << 'EOF' > /health.sh
+#!/bin/sh
+for c in \$(docker ps -q); do
+  s=\$(docker inspect --format='{{.State.Status}}' \$c)
+  if [ \"\$s\" != \"running\" ]; then
+    docker restart \$c
+  fi
+done
+EOF"
+
+  pct exec $CURRENT_ID -- chmod +x /health.sh
+  pct exec $CURRENT_ID -- sh -c "echo '*/5 * * * * /health.sh' | crontab -"
+}
+
+# ==============================================================================
+# 🚀 MAIN LOOP
+# ==============================================================================
+
+for APP in "${ORDERED_APPS[@]}"; do
+
+  VAL="${APPS[$APP]}"
+
+  IP=$(echo $VAL | cut -d':' -f1)
+  TYPE=$(echo $VAL | cut -d':' -f3)
+
+  create_container $APP $IP
+
+  if [ "$TYPE" == "docker" ]; then
+    deploy_docker_app $APP
+    setup_health
+  fi
+
+  log "$APP deployed at $IP"
+
+  ((CURRENT_ID++))
+
+done
+
+# ==============================================================================
+# ✅ DONE
+# ==============================================================================
+
+echo ""
+echo "✅ DEPLOY COMPLETE"
+echo ""
+echo "🌐 Cloudflare URLs:"
+echo "https://jellyfin.yourdomain.com"
+echo "https://seerr.yourdomain.com"
+echo ""
+echo "🔒 Downloads forced through VPN (kill switch active)"
